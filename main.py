@@ -68,6 +68,10 @@ def main():
     use_passive = st.checkbox("Enable Passive Voice Transformation", value=False)
     use_synonyms = st.checkbox("Enable Synonym Replacement", value=False)
 
+    # Controls
+    formality = st.slider("Formality level", 0.0, 1.0, 0.5, 0.1, help="Increase to apply more transformations")
+    ensure_change = st.checkbox("Ensure at least one change per sentence", value=True)
+
     # Text input
     user_text = st.text_area("Enter your text here:")
 
@@ -88,12 +92,22 @@ def main():
                 doc_input = NLP_GLOBAL(user_text)
                 input_sentence_count = len(list(doc_input.sents))
 
-                # Transform
+                # Transform probabilities based on formality level
+                p_passive = max(0.0, min(1.0, 0.1 + 0.7 * formality))
+                p_syn = max(0.0, min(1.0, 0.15 + 0.7 * formality))
+                p_academic = max(0.0, min(1.0, 0.2 + 0.6 * formality))
+
+                # Transformer instance with enforcement of visible change
                 humanizer = AcademicTextHumanizer(
-                    p_passive=0.3,
-                    p_synonym_replacement=0.3,
-                    p_academic_transition=0.4
+                    p_passive=p_passive,
+                    p_synonym_replacement=p_syn,
+                    p_academic_transition=p_academic,
+                    ensure_change=ensure_change
                 )
+
+                # Inform user if high-quality synonym selection model isn't available
+                if use_synonyms and getattr(humanizer, 'model', None) is None:
+                    st.info("Synonym replacement is running in fallback mode (WordNet-only). For improved results, ensure internet access or a cached Hugging Face model.")
                 transformed = humanizer.humanize_text(
                     user_text,
                     use_passive=use_passive,

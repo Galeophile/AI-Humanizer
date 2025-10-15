@@ -1,4 +1,5 @@
 import ssl
+import re
 import random
 import warnings
 
@@ -48,18 +49,26 @@ class AcademicTextHumanizer:
         p_passive=0.2,
         p_synonym_replacement=0.3,
         p_academic_transition=0.3,
-        seed=None
+        seed=None,
+        ensure_change=True
     ):
         if seed is not None:
             random.seed(seed)
 
         self.nlp = spacy.load("en_core_web_sm")
-        self.model = SentenceTransformer(model_name)
+        # Try to load embedding model; gracefully degrade if unavailable (offline/no cache)
+        try:
+            self.model = SentenceTransformer(model_name)
+            self.model_error = None
+        except Exception as e:
+            self.model = None
+            self.model_error = e
 
         # Transformation probabilities
-        self.p_passive = p_passive
-        self.p_synonym_replacement = p_synonym_replacement
-        self.p_academic_transition = p_academic_transition
+        self.p_passive = max(0.0, min(1.0, p_passive))
+        self.p_synonym_replacement = max(0.0, min(1.0, p_synonym_replacement))
+        self.p_academic_transition = max(0.0, min(1.0, p_academic_transition))
+        self.ensure_change = ensure_change
 
         # Common academic transitions
         self.academic_transitions = [
@@ -68,30 +77,84 @@ class AcademicTextHumanizer:
         ]
 
     def humanize_text(self, text, use_passive=False, use_synonyms=False):
+        # Sanitize input to avoid transforming diagnostic logs or stack traces
+        text = self.sanitize_input(text)
         doc = self.nlp(text)
         transformed_sentences = []
+        inserted_transition = False
 
         for sent in doc.sents:
             sentence_str = sent.text.strip()
+            original_sentence = sentence_str
+            changed = False
 
             # 1. Expand contractions
-            sentence_str = self.expand_contractions(sentence_str)
+            expanded = self.expand_contractions(sentence_str)
+            if expanded != sentence_str:
+                changed = True
+                sentence_str = expanded
 
-            # 2. Possibly add academic transitions
-            if random.random() < self.p_academic_transition:
-                sentence_str = self.add_academic_transitions(sentence_str)
+            # 2. Possibly add academic transitions (or ensure at least one early transition)
+            should_transition = (random.random() < self.p_academic_transition) or (self.ensure_change and not changed and not inserted_transition)
+            if should_transition:
+                transitioned = self.add_academic_transitions(sentence_str)
+                if transitioned != sentence_str:
+                    inserted_transition = True
+                    changed = True
+                    sentence_str = transitioned
 
-            # 3. Optionally convert to passive
-            if use_passive and random.random() < self.p_passive:
-                sentence_str = self.convert_to_passive(sentence_str)
+            # 3. Optionally convert to passive (if probability triggers or still no change)
+            if use_passive and (random.random() < self.p_passive or (self.ensure_change and not changed)):
+                passive = self.convert_to_passive(sentence_str)
+                if passive != sentence_str:
+                    changed = True
+                    sentence_str = passive
 
-            # 4. Optionally replace words with synonyms
-            if use_synonyms and random.random() < self.p_synonym_replacement:
-                sentence_str = self.replace_with_synonyms(sentence_str)
+            # 4. Optionally replace words with synonyms (if probability triggers or still no change)
+            if use_synonyms and (random.random() < self.p_synonym_replacement or (self.ensure_change and not changed)):
+                with_syn = self.replace_with_synonyms(sentence_str)
+                if with_syn != sentence_str:
+                    changed = True
+                    sentence_str = with_syn
+                elif self.ensure_change and not changed:
+                    forced_syn, did = self.replace_with_synonyms_force_one(sentence_str)
+                    if did:
+                        changed = True
+                        sentence_str = forced_syn
+
+            # 5. If still no change, gently add a transition on first eligible sentence
+            if not changed and not inserted_transition:
+                transitioned = self.add_academic_transitions(sentence_str)
+                if transitioned != sentence_str:
+                    inserted_transition = True
+                    changed = True
+                    sentence_str = transitioned
 
             transformed_sentences.append(sentence_str)
 
-        return ' '.join(transformed_sentences)
+        final_text = ' '.join(transformed_sentences)
+        return final_text
+
+    def sanitize_input(self, text: str) -> str:
+        """
+        Remove common diagnostic/stack trace lines (e.g., OSError, Traceback, HF URLs)
+        that may accidentally appear in the input text so the transformation output
+        is clean and user-centric.
+        """
+        error_patterns = [
+            r"^\s*Traceback\b",
+            r"^\s*File\s+['\"]?.+?['\"]?,\s*line\s*\d+",
+            r"^\s*OSError\b",
+            r"^\s*EnvironmentError\b",
+            r"https?://huggingface\.co",
+            r"https?://.*transformers/installation#offline-mode",
+            r"^\s*We couldn't connect to",
+            r"^\s*Could not (connect|find)"
+        ]
+        lines = text.splitlines()
+        kept = [line for line in lines if not any(re.search(p, line) for p in error_patterns)]
+        sanitized = "\n".join(kept).strip()
+        return sanitized if sanitized else text
 
     def expand_contractions(self, sentence):
         contraction_map = {
@@ -158,6 +221,46 @@ class AcademicTextHumanizer:
 
         return ' '.join(new_tokens)
 
+    def replace_with_synonyms_force_one(self, sentence):
+        """
+        Attempt to replace at least one token with a reasonable synonym.
+        Returns (new_sentence, did_replace: bool).
+        """
+        tokens = word_tokenize(sentence)
+        pos_tags = nltk.pos_tag(tokens)
+
+        new_tokens = tokens[:]
+        for idx, (word, pos) in enumerate(pos_tags):
+            # Map POS to WordNet POS
+            wn_pos = None
+            if pos.startswith('J'):
+                wn_pos = wordnet.ADJ
+            elif pos.startswith('N'):
+                wn_pos = wordnet.NOUN
+            elif pos.startswith('R'):
+                wn_pos = wordnet.ADV
+            elif pos.startswith('V'):
+                wn_pos = wordnet.VERB
+
+            if wn_pos is None:
+                continue
+
+            synonyms = self._get_synonyms(word, pos)
+            if not synonyms:
+                continue
+
+            # Prefer embedding-based selection; else fallback heuristic
+            if self.model is not None:
+                candidate = self._select_closest_synonym(word, synonyms)
+            else:
+                candidate = self._select_closest_synonym(word, synonyms)  # falls back inside method
+
+            if candidate and candidate.lower() != word.lower():
+                new_tokens[idx] = candidate
+                return ' '.join(new_tokens), True
+
+        return ' '.join(new_tokens), False
+
     def _get_synonyms(self, word, pos):
         wn_pos = None
         if pos.startswith('J'):
@@ -180,11 +283,28 @@ class AcademicTextHumanizer:
     def _select_closest_synonym(self, original_word, synonyms):
         if not synonyms:
             return None
-        original_emb = self.model.encode(original_word, convert_to_tensor=True)
-        synonym_embs = self.model.encode(synonyms, convert_to_tensor=True)
-        cos_scores = util.cos_sim(original_emb, synonym_embs)[0]
-        max_score_index = cos_scores.argmax().item()
-        max_score = cos_scores[max_score_index].item()
-        if max_score >= 0.5:
-            return synonyms[max_score_index]
-        return None
+
+        # If embedding model is available, select by cosine similarity
+        if self.model is not None:
+            original_emb = self.model.encode(original_word, convert_to_tensor=True)
+            synonym_embs = self.model.encode(synonyms, convert_to_tensor=True)
+            cos_scores = util.cos_sim(original_emb, synonym_embs)[0]
+            max_score_index = cos_scores.argmax().item()
+            max_score = cos_scores[max_score_index].item()
+            if max_score >= 0.5:
+                return synonyms[max_score_index]
+            return None
+
+        # Fallback: heuristic selection without embeddings
+        # Prefer synonyms closest in length to the original word
+        try:
+            closest = min(
+                (s for s in synonyms if s.lower() != original_word.lower()),
+                key=lambda s: abs(len(s) - len(original_word))
+            )
+            # If the closest is wildly different, skip replacement
+            if abs(len(closest) - len(original_word)) <= 3:
+                return closest
+            return None
+        except ValueError:
+            return None
