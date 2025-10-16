@@ -1,6 +1,19 @@
 import streamlit as st
 from transformer.app import AcademicTextHumanizer, NLP_GLOBAL, download_nltk_resources
+from transformer.document_parser import (
+    parse_document_file,
+    detect_file_type,
+    get_plain_text, 
+    formatted_document_to_html, 
+    formatted_document_to_docx,
+    text_to_formatted_document,
+    FormattedDocument,
+    FormattedParagraph,
+    FormattedRun
+)
 from nltk.tokenize import word_tokenize
+import io
+
 
 
 
@@ -76,10 +89,31 @@ def main():
     user_text = st.text_area("Enter your text here:")
 
     # File upload
-    uploaded_file = st.file_uploader("Or upload a .txt file:", type=["txt"])
+    uploaded_file = st.file_uploader("Or upload a .txt, .docx, or .pdf file:", type=["txt","docx","pdf"])
+    formatted_doc = None
     if uploaded_file is not None:
-        file_text = uploaded_file.read().decode("utf-8", errors="ignore")
-        user_text = file_text
+        try:
+            # Read file once and wrap with BytesIO
+            file_bytes = uploaded_file.read()
+            file_stream = io.BytesIO(file_bytes)
+            
+            # Parse using unified document parser
+            formatted_doc = parse_document_file(file_stream)
+            user_text = get_plain_text(formatted_doc)
+            
+            # Provide feedback on detected type
+            file_type = detect_file_type(file_stream)
+            st.success(f"Successfully loaded .{file_type} file with {len(formatted_doc.paragraphs)} paragraphs, {len(formatted_doc.list_items)} list items, and {len(formatted_doc.tables)} tables.")
+        except Exception as e:
+            error_message = str(e)
+            if "encrypted" in error_message.lower():
+                st.error("This PDF is password-protected. Upload an unencrypted file.")
+            elif "no extractable text" in error_message.lower() or "scanned" in error_message.lower():
+                st.warning("This PDF has no extractable text (scanned). Please upload a text-based PDF.")
+            else:
+                st.error("Failed to parse file. Ensure it's a valid .txt/.docx/.pdf.")
+            user_text = ""
+            formatted_doc = None
 
     # Button
     if st.button("Transform to Academic Style"):
@@ -108,15 +142,62 @@ def main():
                 # Inform user if high-quality synonym selection model isn't available
                 if use_synonyms and getattr(humanizer, 'model', None) is None:
                     st.info("Synonym replacement is running in fallback mode (WordNet-only). For improved results, ensure internet access or a cached Hugging Face model.")
-                transformed = humanizer.humanize_text(
-                    user_text,
-                    use_passive=use_passive,
-                    use_synonyms=use_synonyms
-                )
+                
+                # Transform using appropriate method based on whether we have formatted document
+                if formatted_doc is not None:
+                    # Use humanize_document to preserve formatting
+                    output_formatted_doc = humanizer.humanize_document(
+                        formatted_doc, 
+                        use_passive=use_passive, 
+                        use_synonyms=use_synonyms
+                    )
+                    transformed = get_plain_text(output_formatted_doc)
+                else:
+                    # For manual text input, first build a simple FormattedDocument then call humanize_document
+                    input_formatted_doc = text_to_formatted_document(user_text)
+                    output_formatted_doc = humanizer.humanize_document(
+                        input_formatted_doc,
+                        use_passive=use_passive,
+                        use_synonyms=use_synonyms
+                    )
+                    transformed = get_plain_text(output_formatted_doc)
 
                 # Output
                 st.subheader("Transformed Text:")
-                st.write(transformed)
+                
+                # Display options
+                display_mode = st.radio("Display format:", ["Plain Text", "HTML Preview"], horizontal=True)
+                
+                if display_mode == "Plain Text":
+                    st.write(transformed)
+                else:
+                    # Render as HTML
+                    html_content = formatted_document_to_html(output_formatted_doc)
+                    st.markdown(html_content, unsafe_allow_html=True)
+
+                # Add download buttons
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.download_button(
+                        label="Download .txt",
+                        data=transformed,
+                        file_name="transformed_output.txt",
+                        mime="text/plain"
+                    )
+                
+                with col2:
+                    # Generate DOCX for download
+                    try:
+                        docx_bytes = formatted_document_to_docx(output_formatted_doc)
+                        st.download_button(
+                            label="Download .docx (with formatting)",
+                            data=docx_bytes,
+                            file_name="transformed_output.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        )
+                    except Exception as e:
+                        st.error(f"Error generating .docx file: {str(e)}")
 
                 # Output stats
                 output_word_count = len(word_tokenize(transformed,language='english', preserve_line=True))

@@ -1,13 +1,19 @@
+from __future__ import annotations
+
 import ssl
 import re
 import random
 import warnings
+from typing import List, Tuple, Dict, TYPE_CHECKING
 
 import nltk
 import spacy
 from nltk.tokenize import word_tokenize
 from nltk.corpus import wordnet
 from sentence_transformers import SentenceTransformer, util
+
+if TYPE_CHECKING:
+    from .document_parser import FormattedDocument, FormattedParagraph, FormattedRun, FormattedListItem, FormattedTable
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -36,11 +42,17 @@ def download_nltk_resources():
 # simplifying complex language.
 class AcademicTextHumanizer:
     """
-    Transforms text into a more formal (academic) style:
+    Transforms text into a more formal (academic) style while preserving formatting.
+    
+    Supports both plain text (via humanize_text()) and formatted documents (via humanize_document()):
       - Expands contractions
       - Adds academic transitions
       - Optionally converts some sentences to passive voice
       - Optionally replaces words with synonyms for more formality
+      
+    For formatted documents, uses token-level alignment to preserve all formatting metadata
+    including bold, italic, fonts, colors, and paragraph styles. The same transformation
+    probabilities and logic apply to both plain text and formatted document modes.
     """
 
     def __init__(
@@ -308,3 +320,490 @@ class AcademicTextHumanizer:
             return None
         except ValueError:
             return None
+
+    def _tokenize_runs_with_formatting(self, runs: List[FormattedRun]) -> Tuple[List[Tuple[str, FormattedRun, str]], str]:
+        """
+        Tokenize runs while preserving formatting metadata and original whitespace.
+        
+        Args:
+            runs: List of FormattedRun objects
+            
+        Returns:
+            Tuple of:
+            - List of tuples: (token, source_run, following_whitespace)
+            - Full concatenated text for reference
+        """
+        import re
+        
+        # Build char-level concatenation with run boundary tracking
+        full_text = ""
+        run_boundaries = []  # (start_char, end_char, run)
+        
+        for run in runs:
+            start_pos = len(full_text)
+            full_text += run.text
+            end_pos = len(full_text)
+            run_boundaries.append((start_pos, end_pos, run))
+        
+        if not full_text.strip():
+            return [], full_text
+        
+        # Tokenize the full text while preserving whitespace info
+        token_pattern = r'\S+|\s+'
+        matches = list(re.finditer(token_pattern, full_text))
+        
+        token_format_map = []
+        
+        for i, match in enumerate(matches):
+            token_text = match.group()
+            start_char = match.start()
+            end_char = match.end()
+            
+            # Skip pure whitespace tokens for processing, but track them
+            if not token_text.strip():
+                continue
+            
+            # Find which run(s) this token belongs to
+            dominant_run = None
+            max_overlap = 0
+            
+            for run_start, run_end, run in run_boundaries:
+                overlap_start = max(start_char, run_start)
+                overlap_end = min(end_char, run_end)
+                overlap = max(0, overlap_end - overlap_start)
+                
+                if overlap > max_overlap:
+                    max_overlap = overlap
+                    dominant_run = run
+            
+            # Determine following whitespace
+            following_whitespace = ""
+            if i + 1 < len(matches):
+                next_match = matches[i + 1]
+                next_text = next_match.group()
+                if not next_text.strip():  # Next token is whitespace
+                    following_whitespace = next_text
+                    # Look ahead to see if there's more whitespace
+                    j = i + 2
+                    while j < len(matches) and not matches[j].group().strip():
+                        following_whitespace += matches[j].group()
+                        j += 1
+            
+            if dominant_run:
+                token_format_map.append((token_text, dominant_run, following_whitespace))
+        
+        return token_format_map, full_text
+
+    def _reconstruct_runs_from_tokens(self, transformed_text: str, original_token_map: List[Tuple[str, FormattedRun, str]]) -> List[FormattedRun]:
+        """
+        Reconstruct formatted runs from transformed text using preserved whitespace.
+        
+        Args:
+            transformed_text: The transformed text string
+            original_token_map: Original token-to-formatting mapping with whitespace info
+            
+        Returns:
+            List of FormattedRun objects with formatting preserved
+        """
+        from .document_parser import FormattedRun
+        
+        if not transformed_text.strip() or not original_token_map:
+            return [FormattedRun(text=transformed_text)]
+        
+        transformed_tokens = word_tokenize(transformed_text)
+        new_runs = []
+        original_consumed = 0
+        
+        for i, token in enumerate(transformed_tokens):
+            found_match = False
+            
+            # Try to find exact match in remaining original tokens
+            for j in range(original_consumed, len(original_token_map)):
+                orig_token, orig_run, orig_whitespace = original_token_map[j]
+                
+                if token.lower() == orig_token.lower():
+                    # Exact match - use original formatting and whitespace
+                    token_with_whitespace = token + orig_whitespace
+                    
+                    if new_runs and self._runs_have_same_formatting(new_runs[-1], orig_run):
+                        # Merge with previous run if same formatting
+                        new_runs[-1] = FormattedRun(
+                            text=new_runs[-1].text + token_with_whitespace,
+                            bold=orig_run.bold,
+                            italic=orig_run.italic,
+                            underline=orig_run.underline,
+                            underline_style=orig_run.underline_style,
+                            font_name=orig_run.font_name,
+                            font_size=orig_run.font_size,
+                            color=orig_run.color,
+                            highlight=orig_run.highlight
+                        )
+                    else:
+                        # Create new run
+                        new_runs.append(FormattedRun(
+                            text=token_with_whitespace,
+                            bold=orig_run.bold,
+                            italic=orig_run.italic,
+                            underline=orig_run.underline,
+                            underline_style=orig_run.underline_style,
+                            font_name=orig_run.font_name,
+                            font_size=orig_run.font_size,
+                            color=orig_run.color,
+                            highlight=orig_run.highlight
+                        ))
+                    original_consumed = j + 1
+                    found_match = True
+                    break
+            
+            # If no exact match, try fuzzy matching with WordNet lemmatization
+            if not found_match:
+                for j in range(original_consumed, len(original_token_map)):
+                    orig_token, orig_run, orig_whitespace = original_token_map[j]
+                    
+                    # Check if tokens are related through lemmatization
+                    if self._tokens_are_related(token, orig_token):
+                        token_with_whitespace = token + orig_whitespace
+                        
+                        if new_runs and self._runs_have_same_formatting(new_runs[-1], orig_run):
+                            new_runs[-1] = FormattedRun(
+                                text=new_runs[-1].text + token_with_whitespace,
+                                bold=orig_run.bold,
+                                italic=orig_run.italic,
+                                underline=orig_run.underline,
+                                underline_style=orig_run.underline_style,
+                                font_name=orig_run.font_name,
+                                font_size=orig_run.font_size,
+                                color=orig_run.color,
+                                highlight=orig_run.highlight
+                            )
+                        else:
+                            new_runs.append(FormattedRun(
+                                text=token_with_whitespace,
+                                bold=orig_run.bold,
+                                italic=orig_run.italic,
+                                underline=orig_run.underline,
+                                underline_style=orig_run.underline_style,
+                                font_name=orig_run.font_name,
+                                font_size=orig_run.font_size,
+                                color=orig_run.color,
+                                highlight=orig_run.highlight
+                            ))
+                        original_consumed = j + 1
+                        found_match = True
+                        break
+            
+            # If still no match, create new run with default formatting
+            if not found_match:
+                # Use space as default whitespace except for last token
+                default_whitespace = " " if i < len(transformed_tokens) - 1 else ""
+                token_with_whitespace = token + default_whitespace
+                
+                if new_runs and self._is_default_formatting(new_runs[-1]):
+                    # Merge with previous default-formatted run
+                    new_runs[-1] = FormattedRun(text=new_runs[-1].text + token_with_whitespace)
+                else:
+                    # Create new default run
+                    new_runs.append(FormattedRun(text=token_with_whitespace))
+        
+        return self._merge_consecutive_runs_whitespace_aware(new_runs)
+
+    def _runs_have_same_formatting(self, run1: FormattedRun, run2: FormattedRun) -> bool:
+        """Check if two runs have identical formatting."""
+        return (run1.bold == run2.bold and
+                run1.italic == run2.italic and
+                run1.underline == run2.underline and
+                run1.underline_style == run2.underline_style and
+                run1.font_name == run2.font_name and
+                run1.font_size == run2.font_size and
+                run1.color == run2.color and
+                run1.highlight == run2.highlight)
+
+    def _tokens_are_related(self, token1: str, token2: str) -> bool:
+        """Check if two tokens are related through lemmatization."""
+        if token1.lower() == token2.lower():
+            return True
+        
+        # Try WordNet lemmatization
+        try:
+            synsets1 = wordnet.synsets(token1.lower())
+            synsets2 = wordnet.synsets(token2.lower())
+            
+            for syn1 in synsets1:
+                for syn2 in synsets2:
+                    if syn1 == syn2:
+                        return True
+                        
+            # Check if one is a lemma of the other
+            for syn1 in synsets1:
+                for lemma in syn1.lemmas():
+                    if lemma.name().lower() == token2.lower():
+                        return True
+                        
+            for syn2 in synsets2:
+                for lemma in syn2.lemmas():
+                    if lemma.name().lower() == token1.lower():
+                        return True
+        except:
+            pass
+        
+        return False
+
+    def _is_default_formatting(self, run: FormattedRun) -> bool:
+        """Check if a run has default formatting (no bold, italic, etc.)."""
+        return (not run.bold and 
+                not run.italic and 
+                not run.underline and 
+                run.underline_style is None and 
+                run.font_name is None and 
+                run.font_size is None and 
+                run.color is None and 
+                run.highlight is None)
+
+    def _merge_consecutive_runs_whitespace_aware(self, runs: List[FormattedRun]) -> List[FormattedRun]:
+        """Merge consecutive runs with identical formatting without adding extra spaces."""
+        if not runs:
+            return []
+        
+        merged = []
+        current_run = runs[0]
+        
+        for next_run in runs[1:]:
+            if self._runs_have_same_formatting(current_run, next_run):
+                # Merge text without adding spaces (whitespace already included)
+                current_run = FormattedRun(
+                    text=current_run.text + next_run.text,
+                    bold=current_run.bold,
+                    italic=current_run.italic,
+                    underline=current_run.underline,
+                    underline_style=current_run.underline_style,
+                    font_name=current_run.font_name,
+                    font_size=current_run.font_size,
+                    color=current_run.color,
+                    highlight=current_run.highlight
+                )
+            else:
+                merged.append(current_run)
+                current_run = next_run
+        
+        merged.append(current_run)
+        return merged
+
+    def _merge_consecutive_runs(self, runs: List[FormattedRun]) -> List[FormattedRun]:
+        """Merge consecutive runs with identical formatting (legacy method)."""
+        if not runs:
+            return []
+        
+        merged = []
+        current_run = runs[0]
+        
+        for next_run in runs[1:]:
+            if self._runs_have_same_formatting(current_run, next_run):
+                # Merge text without unconditionally adding spaces
+                separator = " " if not current_run.text.endswith(" ") and not next_run.text.startswith(" ") else ""
+                current_run = FormattedRun(
+                    text=current_run.text + separator + next_run.text,
+                    bold=current_run.bold,
+                    italic=current_run.italic,
+                    underline=current_run.underline,
+                    underline_style=current_run.underline_style,
+                    font_name=current_run.font_name,
+                    font_size=current_run.font_size,
+                    color=current_run.color,
+                    highlight=current_run.highlight
+                )
+            else:
+                merged.append(current_run)
+                current_run = next_run
+        
+        merged.append(current_run)
+        return merged
+
+    def _extract_plain_text_from_paragraph(self, para: FormattedParagraph) -> str:
+        """
+        Extract plain text from a FormattedParagraph.
+        
+        Args:
+            para: The FormattedParagraph object
+            
+        Returns:
+            Plain text string
+        """
+        return ''.join(run.text for run in para.runs)
+
+    def _copy_paragraph_formatting(self, source_para: FormattedParagraph, new_runs: List[FormattedRun]) -> FormattedParagraph:
+        """
+        Copy paragraph-level formatting attributes to a new paragraph with different runs.
+        
+        Args:
+            source_para: Source paragraph with original formatting
+            new_runs: New runs to use in the paragraph
+            
+        Returns:
+            New FormattedParagraph with copied formatting
+        """
+        from .document_parser import FormattedParagraph
+        
+        return FormattedParagraph(
+            runs=new_runs,
+            style=source_para.style,
+            alignment=source_para.alignment,
+            space_before=source_para.space_before,
+            space_after=source_para.space_after,
+            line_spacing=source_para.line_spacing,
+            left_indent=source_para.left_indent,
+            right_indent=source_para.right_indent,
+            first_line_indent=source_para.first_line_indent
+        )
+
+    def humanize_paragraph(self, para: FormattedParagraph, use_passive: bool = False, use_synonyms: bool = False) -> FormattedParagraph:
+        """
+        Transform a single formatted paragraph while preserving formatting.
+        
+        Args:
+            para: The FormattedParagraph to transform
+            use_passive: Whether to apply passive voice transformations
+            use_synonyms: Whether to apply synonym replacements
+            
+        Returns:
+            Transformed FormattedParagraph with formatting preserved
+        """
+        # Handle empty paragraphs
+        if not para.runs or not any(run.text.strip() for run in para.runs):
+            return para
+        
+        try:
+            # Extract plain text for transformation
+            plain_text = self._extract_plain_text_from_paragraph(para)
+            
+            # Build token-to-formatting map with whitespace preservation
+            token_format_map, original_full_text = self._tokenize_runs_with_formatting(para.runs)
+            
+            # Apply existing transformation logic
+            transformed_text = self.humanize_text(plain_text, use_passive=use_passive, use_synonyms=use_synonyms)
+            
+            # Reconstruct formatted runs
+            new_runs = self._reconstruct_runs_from_tokens(transformed_text, token_format_map)
+            
+            # Create new paragraph with transformed runs but original formatting
+            return self._copy_paragraph_formatting(para, new_runs)
+            
+        except Exception:
+            # If transformation fails, return original paragraph
+            return para
+
+    def humanize_document(self, formatted_doc: FormattedDocument, use_passive: bool = False, use_synonyms: bool = False) -> FormattedDocument:
+        """
+        Transform a formatted document while preserving all formatting.
+        
+        Args:
+            formatted_doc: The FormattedDocument to transform
+            use_passive: Whether to apply passive voice transformations
+            use_synonyms: Whether to apply synonym replacements
+            
+        Returns:
+            Transformed FormattedDocument with formatting preserved
+        """
+        from .document_parser import FormattedDocument, FormattedListItem, FormattedTable
+        
+        try:
+            # Process regular paragraphs
+            transformed_paragraphs = []
+            for para in formatted_doc.paragraphs:
+                transformed_para = self.humanize_paragraph(para, use_passive=use_passive, use_synonyms=use_synonyms)
+                transformed_paragraphs.append(transformed_para)
+            
+            # Process list items
+            transformed_list_items = []
+            for list_item in formatted_doc.list_items:
+                transformed_para = self.humanize_paragraph(list_item.paragraph, use_passive=use_passive, use_synonyms=use_synonyms)
+                transformed_list_item = FormattedListItem(
+                    paragraph=transformed_para,
+                    level=list_item.level,
+                    list_type=list_item.list_type,
+                    number_format=list_item.number_format
+                )
+                transformed_list_items.append(transformed_list_item)
+            
+            # Process tables
+            transformed_tables = []
+            for table in formatted_doc.tables:
+                transformed_rows = []
+                for row in table.rows:
+                    transformed_row = []
+                    for cell in row:
+                        transformed_cell = []
+                        for cell_para in cell:
+                            transformed_cell_para = self.humanize_paragraph(cell_para, use_passive=use_passive, use_synonyms=use_synonyms)
+                            transformed_cell.append(transformed_cell_para)
+                        transformed_row.append(transformed_cell)
+                    transformed_rows.append(transformed_row)
+                
+                transformed_table = FormattedTable(
+                    rows=transformed_rows,
+                    style=table.style
+                )
+                transformed_tables.append(transformed_table)
+            
+            # Create and return new document with transformed content
+            return FormattedDocument(
+                paragraphs=transformed_paragraphs,
+                tables=transformed_tables,
+                list_items=transformed_list_items,
+                styles=formatted_doc.styles
+            )
+            
+        except Exception:
+            # If transformation fails, return original document
+            return formatted_doc
+
+
+# Module-level convenience functions
+def humanize_text(text: str, use_passive: bool = False, use_synonyms: bool = False, **kwargs) -> str:
+    """
+    Module-level convenience function to humanize plain text.
+    
+    Args:
+        text: Plain text to transform
+        use_passive: Whether to apply passive voice transformations
+        use_synonyms: Whether to apply synonym replacements
+        **kwargs: Additional arguments passed to AcademicTextHumanizer constructor
+        
+    Returns:
+        Transformed text string
+    """
+    humanizer = AcademicTextHumanizer(**kwargs)
+    return humanizer.humanize_text(text, use_passive=use_passive, use_synonyms=use_synonyms)
+
+
+def humanize_paragraph(para: "FormattedParagraph", use_passive: bool = False, use_synonyms: bool = False, **kwargs) -> "FormattedParagraph":
+    """
+    Module-level convenience function to humanize a formatted paragraph.
+    
+    Args:
+        para: FormattedParagraph to transform
+        use_passive: Whether to apply passive voice transformations
+        use_synonyms: Whether to apply synonym replacements
+        **kwargs: Additional arguments passed to AcademicTextHumanizer constructor
+        
+    Returns:
+        Transformed FormattedParagraph with formatting preserved
+    """
+    humanizer = AcademicTextHumanizer(**kwargs)
+    return humanizer.humanize_paragraph(para, use_passive=use_passive, use_synonyms=use_synonyms)
+
+
+def humanize_document(doc: "FormattedDocument", use_passive: bool = False, use_synonyms: bool = False, **kwargs) -> "FormattedDocument":
+    """
+    Module-level convenience function to humanize a formatted document.
+    
+    Args:
+        doc: FormattedDocument to transform
+        use_passive: Whether to apply passive voice transformations
+        use_synonyms: Whether to apply synonym replacements
+        **kwargs: Additional arguments passed to AcademicTextHumanizer constructor
+        
+    Returns:
+        Transformed FormattedDocument with formatting preserved
+    """
+    humanizer = AcademicTextHumanizer(**kwargs)
+    return humanizer.humanize_document(doc, use_passive=use_passive, use_synonyms=use_synonyms)

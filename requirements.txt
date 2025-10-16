@@ -37,6 +37,7 @@ nltk==3.9.1
 numpy==2.2.2
 packaging==24.2
 pandas==2.2.3
+pdfplumber==0.11.4
 pillow==11.1.0
 preshed==3.0.9
 protobuf==5.29.3
